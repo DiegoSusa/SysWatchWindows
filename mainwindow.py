@@ -17,7 +17,6 @@ MB = 1024 ** 2
 GB = 1024 ** 3
 
 
-
 class NumericItem(QTableWidgetItem):
     def __init__(self, value: float, text: str | None = None):
         super().__init__(text if text is not None else f"{value}")
@@ -38,25 +37,27 @@ class MainWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
 
+        # ---------- Config inicial de controles ----------
         try:
-            self.ui.SpinIntervalo.setRange(100, 10000)
-            if self.ui.SpinIntervalo.value() < 100:
-                self.ui.SpinIntervalo.setValue(1000)  
+            self.ui.SpinIntervalo.setRange(200, 10000)  # subimos el mínimo a 200ms para evitar micro-lags
+            if self.ui.SpinIntervalo.value() < 200:
+                self.ui.SpinIntervalo.setValue(1000)
         except Exception:
             pass
         try:
             self.ui.SpinCantidad.setRange(1, 200)
-            if self.ui.SpinCantidad.value() < 5:
-                self.ui.SpinCantidad.setValue(20)    
+            if self.ui.SpinCantidad.value() < 20:
+                self.ui.SpinCantidad.setValue(20)
         except Exception:
             pass
 
+        # ---------- Gráficos ----------
         for w in (self.ui.graphic1, self.ui.graphic2, self.ui.graphic3):
             w.setBackground('#26253a')
             w.getAxis("left").setPen("#f0f0f0")
             w.getAxis("bottom").setPen("#f0f0f0")
             w.showGrid(x=True, y=True, alpha=0.2)
-            w.setYRange(0, 100)  
+            w.setYRange(0, 100)
             w.setXRange(0, 60)
 
         self.ui.progressBarCPU.setRange(0, 100)
@@ -73,50 +74,57 @@ class MainWindow(QMainWindow):
         self.mem_curve = self.ui.graphic2.plot(self.x_vals, self.mem_vals, pen=pg.mkPen("#00ff85", width=2))
         self.dsk_curve = self.ui.graphic3.plot(self.x_vals, self.dsk_vals, pen=pg.mkPen("#3a7dff", width=2))
 
+        # ---------- Tabla ----------
         self.table = self.ui.tableProcesos
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["PID", "NOMBRE", "CPU %", "RAM (MB)"])
-        self.table.setSortingEnabled(True) 
+        self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setDefaultSectionSize(24)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch) 
+        # Estas dos líneas se movieron aquí para no re-aplicarlas en cada refresh:
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
 
+        # ---------- Señales ----------
         self.ui.LineEditFiltroNombre.textChanged.connect(self.refresh_table)
         self.ui.pushButtonRefresh.clicked.connect(self.refresh_all)
         self.ui.pushButtonKill.clicked.connect(self.kill_selected_process)
         self.ui.SpinCantidad.valueChanged.connect(lambda _: self.refresh_table())
         self.ui.SpinIntervalo.valueChanged.connect(self.update_interval)
 
+        # ---------- Timer principal ----------
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
-        self.timer.setInterval(max(100, int(self.ui.SpinIntervalo.value())))
+        self.timer.setInterval(max(200, int(self.ui.SpinIntervalo.value())))
 
+        # Warm-up CPU global para evitar 0% en la primera lectura
         try:
-            psutil.cpu_percent(None) 
+            psutil.cpu_percent(None)
         except Exception:
             pass
 
+        # ---------- Caches / estado ----------
         self.proc_cache: dict[int, psutil.Process] = {}
-
-        self.prev_disk_global = None        
-        self.prev_disk_perdisk = {}        
-        self.prev_disk_t = None              
+        self.prev_disk_global = None
+        self.prev_disk_perdisk = {}
+        self.prev_disk_t = None
 
         self.proc_snapshot = []
+        self.last_proc_update_t = 0.0
+        self.proc_refresh_interval_sec = 1.0  # <-- snapshot de procesos cada 1 segundo
 
         self.timer.start()
         self.refresh_all()
 
     def _tick(self):
-        cpu = psutil.cpu_percent(interval=None) 
-
+        # Métricas globales (rápidas)
+        cpu = psutil.cpu_percent(interval=None)
         vm = psutil.virtual_memory()
         mem_percent = vm.percent
-
         disk_active = self._disk_active_percent()
 
         mount = 'C:\\' if os.name == 'nt' else '/'
@@ -129,24 +137,26 @@ class MainWindow(QMainWindow):
         used_mem_gb  = (vm.total - vm.available) / GB
         free_mem_gb  = vm.available / GB
 
+        # Barras
         self.ui.progressBarCPU.setValue(int(cpu))
         self.ui.progressBarMem.setValue(int(mem_percent))
         self.ui.progressBarDisc.setValue(int(disk_active))
 
-        self.cpu_vals = self.cpu_vals[1:] + [cpu]
-        self.mem_vals = self.mem_vals[1:] + [mem_percent]
-        self.dsk_vals = self.dsk_vals[1:] + [disk_active]
+        # Curvas (evitamos crear nuevas listas)
+        self.cpu_vals.pop(0); self.cpu_vals.append(cpu)
+        self.mem_vals.pop(0); self.mem_vals.append(mem_percent)
+        self.dsk_vals.pop(0); self.dsk_vals.append(disk_active)
         self.cpu_curve.setData(self.x_vals, self.cpu_vals)
         self.mem_curve.setData(self.x_vals, self.mem_vals)
         self.dsk_curve.setData(self.x_vals, self.dsk_vals)
 
+        # Etiquetas informativas (protegido)
         try:
             self.ui.TotalDisc.setText(f"Total: {total_gb:.1f}GB")
             self.ui.UsadoDisc.setText(f" Usado: {used_gb:.1f}GB")
             self.ui.LibreDisc.setText(f"Libre: {free_gb:.1f}GB")
         except Exception:
             pass
-
         try:
             self.ui.TotalMem.setText(f"Total: {total_mem_gb:.1f}GB")
             self.ui.UsadoMem.setText(f"Usado: {used_mem_gb:.1f}GB")
@@ -154,16 +164,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        self._update_proc_cache_and_snapshot()
+        # Snapshot de procesos solo cada X segundos (reduce bloqueo de GUI)
+        now = time.monotonic()
+        if (now - self.last_proc_update_t) >= self.proc_refresh_interval_sec:
+            self._update_proc_cache_and_snapshot()
+            self.last_proc_update_t = now
 
+        # Refrescar tabla (barato porque usa el snapshot ya calculado)
         self.refresh_table()
 
     def _disk_active_percent(self):
-        
         now = time.monotonic()
 
         try:
-            cur = psutil.disk_io_counters() 
+            cur = psutil.disk_io_counters()
         except Exception:
             cur = None
 
@@ -243,10 +257,10 @@ class MainWindow(QMainWindow):
         return 0.0
 
     def _update_proc_cache_and_snapshot(self):
-
         current_pids = set()
         snapshot = []
 
+        # Recorremos procesos con atributos mínimos para evitar llamadas extra
         for p in psutil.process_iter(['pid', 'name']):
             pid = p.info['pid']
             name = (p.info['name'] or "")
@@ -260,21 +274,21 @@ class MainWindow(QMainWindow):
             if proc is None:
                 try:
                     proc = psutil.Process(pid)
-                    proc.cpu_percent(None) 
+                    # Prime de CPU para ese proceso
+                    proc.cpu_percent(None)
                     self.proc_cache[pid] = proc
                     cpu_val = 0.0
+                    mem_mb = float((proc.memory_info().rss) / MB) if proc.is_running() else 0.0
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
             else:
                 try:
-                    cpu_val = proc.cpu_percent(None)  
+                    # oneshot para minimizar syscalls por proceso
+                    with proc.oneshot():
+                        cpu_val = proc.cpu_percent(None)
+                        mem_mb = proc.memory_info().rss / MB
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
-
-            try:
-                mem_mb = proc.memory_info().rss / MB
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                mem_mb = 0.0
 
             snapshot.append({
                 "pid": pid,
@@ -283,6 +297,7 @@ class MainWindow(QMainWindow):
                 "mem_mb": float(mem_mb),
             })
 
+        # Limpieza de cache de procesos muertos
         stale = set(self.proc_cache.keys()) - current_pids
         for pid in stale:
             self.proc_cache.pop(pid, None)
@@ -293,14 +308,14 @@ class MainWindow(QMainWindow):
         filtro = self.ui.LineEditFiltroNombre.text().strip().lower()
         limite = max(1, int(self.ui.SpinCantidad.value()))
 
-        rows = []
-        for r in self.proc_snapshot:
-            if filtro and filtro not in r['name'].lower():
-                continue
-            rows.append(r)
+        # Filtrado barato sobre el snapshot ya calculado
+        if filtro:
+            rows = [r for r in self.proc_snapshot if filtro in r['name'].lower()]
+        else:
+            rows = self.proc_snapshot
 
+        # Orden: CPU desc, RAM desc
         rows.sort(key=lambda r: (r['cpu'], r['mem_mb']), reverse=True)
-
         return rows[:limite]
 
     def refresh_table(self):
@@ -308,7 +323,10 @@ class MainWindow(QMainWindow):
         sort_col = header.sortIndicatorSection()
         sort_order = header.sortIndicatorOrder()
 
+        # Llenado barato de tabla sin repintado constante
         self.table.setSortingEnabled(False)
+        self.table.setUpdatesEnabled(False)
+
         data = self.get_process_list()
         self.table.setRowCount(len(data))
 
@@ -336,10 +354,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(r, 2, item_cpu)
             self.table.setItem(r, 3, item_mem)
 
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        self.table.verticalHeader().setDefaultSectionSize(24)
-
+        self.table.setUpdatesEnabled(True)
         self.table.setSortingEnabled(True)
         self.table.sortItems(sort_col, sort_order)
 
@@ -347,7 +362,7 @@ class MainWindow(QMainWindow):
         self._tick()
 
     def update_interval(self):
-        ms = max(100, int(self.ui.SpinIntervalo.value()))
+        ms = max(200, int(self.ui.SpinIntervalo.value()))
         self.timer.setInterval(ms)
 
     def kill_selected_process(self):
