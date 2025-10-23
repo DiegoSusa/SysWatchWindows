@@ -37,9 +37,8 @@ class MainWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
 
-        # ---------- Config inicial de controles ----------
         try:
-            self.ui.SpinIntervalo.setRange(200, 10000)  # subimos el mínimo a 200ms para evitar micro-lags
+            self.ui.SpinIntervalo.setRange(200, 10000)  
             if self.ui.SpinIntervalo.value() < 200:
                 self.ui.SpinIntervalo.setValue(1000)
         except Exception:
@@ -51,7 +50,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # ---------- Gráficos ----------
         for w in (self.ui.graphic1, self.ui.graphic2, self.ui.graphic3):
             w.setBackground('#26253a')
             w.getAxis("left").setPen("#f0f0f0")
@@ -74,7 +72,6 @@ class MainWindow(QMainWindow):
         self.mem_curve = self.ui.graphic2.plot(self.x_vals, self.mem_vals, pen=pg.mkPen("#00ff85", width=2))
         self.dsk_curve = self.ui.graphic3.plot(self.x_vals, self.dsk_vals, pen=pg.mkPen("#3a7dff", width=2))
 
-        # ---------- Tabla ----------
         self.table = self.ui.tableProcesos
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["PID", "NOMBRE", "CPU %", "RAM (MB)"])
@@ -85,43 +82,39 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setDefaultSectionSize(24)
-        # Estas dos líneas se movieron aquí para no re-aplicarlas en cada refresh:
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
 
-        # ---------- Señales ----------
         self.ui.LineEditFiltroNombre.textChanged.connect(self.refresh_table)
         self.ui.pushButtonRefresh.clicked.connect(self.refresh_all)
         self.ui.pushButtonKill.clicked.connect(self.kill_selected_process)
         self.ui.SpinCantidad.valueChanged.connect(lambda _: self.refresh_table())
         self.ui.SpinIntervalo.valueChanged.connect(self.update_interval)
 
-        # ---------- Timer principal ----------
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.setInterval(max(200, int(self.ui.SpinIntervalo.value())))
 
-        # Warm-up CPU global para evitar 0% en la primera lectura
         try:
             psutil.cpu_percent(None)
         except Exception:
             pass
 
-        # ---------- Caches / estado ----------
         self.proc_cache: dict[int, psutil.Process] = {}
         self.prev_disk_global = None
+        self._disk_ref_mb_s = 50.0   
+        self._disk_ref_decay = 0.98  
         self.prev_disk_perdisk = {}
         self.prev_disk_t = None
 
         self.proc_snapshot = []
         self.last_proc_update_t = 0.0
-        self.proc_refresh_interval_sec = 1.0  # <-- snapshot de procesos cada 1 segundo
+        self.proc_refresh_interval_sec = 1.0 
 
         self.timer.start()
         self.refresh_all()
 
     def _tick(self):
-        # Métricas globales (rápidas)
         cpu = psutil.cpu_percent(interval=None)
         vm = psutil.virtual_memory()
         mem_percent = vm.percent
@@ -137,12 +130,10 @@ class MainWindow(QMainWindow):
         used_mem_gb  = (vm.total - vm.available) / GB
         free_mem_gb  = vm.available / GB
 
-        # Barras
         self.ui.progressBarCPU.setValue(int(cpu))
         self.ui.progressBarMem.setValue(int(mem_percent))
         self.ui.progressBarDisc.setValue(int(disk_active))
 
-        # Curvas (evitamos crear nuevas listas)
         self.cpu_vals.pop(0); self.cpu_vals.append(cpu)
         self.mem_vals.pop(0); self.mem_vals.append(mem_percent)
         self.dsk_vals.pop(0); self.dsk_vals.append(disk_active)
@@ -150,7 +141,6 @@ class MainWindow(QMainWindow):
         self.mem_curve.setData(self.x_vals, self.mem_vals)
         self.dsk_curve.setData(self.x_vals, self.dsk_vals)
 
-        # Etiquetas informativas (protegido)
         try:
             self.ui.TotalDisc.setText(f"Total: {total_gb:.1f}GB")
             self.ui.UsadoDisc.setText(f" Usado: {used_gb:.1f}GB")
@@ -164,103 +154,69 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Snapshot de procesos solo cada X segundos (reduce bloqueo de GUI)
         now = time.monotonic()
         if (now - self.last_proc_update_t) >= self.proc_refresh_interval_sec:
             self._update_proc_cache_and_snapshot()
             self.last_proc_update_t = now
 
-        # Refrescar tabla (barato porque usa el snapshot ya calculado)
         self.refresh_table()
 
-    def _disk_active_percent(self):
+    def _disk_active_percent(self) -> float:
         now = time.monotonic()
-
         try:
             cur = psutil.disk_io_counters()
         except Exception:
-            cur = None
+            self.prev_disk_t = now
+            return 0.0
+        if cur is None:
+            self.prev_disk_t = now
+            return 0.0
 
-        if cur is not None and hasattr(cur, "busy_time"):
-            busy_ms = getattr(cur, "busy_time", None)
-            if busy_ms is not None:
-                if self.prev_disk_global is None or self.prev_disk_t is None:
-                    self.prev_disk_global = cur
-                    self.prev_disk_t = now
-                    return 0.0
-                dt = max(1e-3, now - self.prev_disk_t)
-                dbusy = max(0.0, busy_ms - getattr(self.prev_disk_global, "busy_time", 0.0))
-                self.prev_disk_global = cur
-                self.prev_disk_t = now
-                return max(0.0, min(100.0, (dbusy / (dt * 1000.0)) * 100.0))
-
-        try:
-            per = psutil.disk_io_counters(perdisk=True)
-        except Exception:
-            per = None
-
-        if per:
-            has_busy = any(hasattr(c, "busy_time") for c in per.values())
-            if has_busy:
-                if not self.prev_disk_perdisk or self.prev_disk_t is None:
-                    self.prev_disk_perdisk = per
-                    self.prev_disk_t = now
-                    return 0.0
-                dt = max(1e-3, now - self.prev_disk_t)
-                max_percent = 0.0
-                for name, curc in per.items():
-                    prevc = self.prev_disk_perdisk.get(name)
-                    if prevc is None:
-                        continue
-                    dbusy = max(0.0, getattr(curc, "busy_time", 0.0) - getattr(prevc, "busy_time", 0.0))
-                    percent = (dbusy / (dt * 1000.0)) * 100.0
-                    if percent > max_percent:
-                        max_percent = percent
-                self.prev_disk_perdisk = per
-                self.prev_disk_t = now
-                return max(0.0, min(100.0, max_percent))
-
-        if cur is not None and (hasattr(cur, "read_time") or hasattr(cur, "write_time")):
-            if self.prev_disk_global is None or self.prev_disk_t is None:
-                self.prev_disk_global = cur
-                self.prev_disk_t = now
-                return 0.0
-            dt = max(1e-3, now - self.prev_disk_t)
-            dread = max(0.0, getattr(cur, "read_time", 0.0) - getattr(self.prev_disk_global, "read_time", 0.0))
-            dwrite = max(0.0, getattr(cur, "write_time", 0.0) - getattr(self.prev_disk_global, "write_time", 0.0))
+        if self.prev_disk_global is None or self.prev_disk_t is None:
             self.prev_disk_global = cur
             self.prev_disk_t = now
-            percent = ((dread + dwrite) / (dt * 1000.0)) * 100.0
-            return max(0.0, min(100.0, percent))
+            return 0.0
 
-        if per:
-            if not self.prev_disk_perdisk or self.prev_disk_t is None:
-                self.prev_disk_perdisk = per
-                self.prev_disk_t = now
-                return 0.0
-            dt = max(1e-3, now - self.prev_disk_t)
-            max_percent = 0.0
-            for name, curc in per.items():
-                prevc = self.prev_disk_perdisk.get(name)
-                if prevc is None:
-                    continue
-                dread = max(0.0, getattr(curc, "read_time", 0.0) - getattr(prevc, "read_time", 0.0))
-                dwrite = max(0.0, getattr(curc, "write_time", 0.0) - getattr(prevc, "write_time", 0.0))
-                percent = ((dread + dwrite) / (dt * 1000.0)) * 100.0
-                if percent > max_percent:
-                    max_percent = percent
-            self.prev_disk_perdisk = per
-            self.prev_disk_t = now
-            return max(0.0, min(100.0, max_percent))
+        dt = max(1e-3, now - self.prev_disk_t)
 
+        busy_now = getattr(cur, "busy_time", None)
+        busy_prev = getattr(self.prev_disk_global, "busy_time", None)
+        if busy_now is not None and busy_prev is not None:
+            dbusy_ms = max(0.0, busy_now - busy_prev)
+            pct = (dbusy_ms / (dt * 1000.0)) * 100.0
+
+        else:
+            r_now  = float(getattr(cur, "read_time", 0.0))
+            r_prev = float(getattr(self.prev_disk_global, "read_time", 0.0))
+            w_now  = float(getattr(cur, "write_time", 0.0))
+            w_prev = float(getattr(self.prev_disk_global, "write_time", 0.0))
+
+            dms = max(0.0, r_now - r_prev) + max(0.0, w_now - w_prev)
+            pct = (dms / (dt * 1000.0)) * 100.0
+
+            if pct == 0.0:
+                rb_now  = float(getattr(cur, "read_bytes", 0.0))
+                rb_prev = float(getattr(self.prev_disk_global, "read_bytes", 0.0))
+                wb_now  = float(getattr(cur, "write_bytes", 0.0))
+                wb_prev = float(getattr(self.prev_disk_global, "write_bytes", 0.0))
+
+                dbytes = max(0.0, rb_now - rb_prev) + max(0.0, wb_now - wb_prev)
+                mbps = dbytes / (dt * MB)
+
+                self._disk_ref_mb_s = max(self._disk_ref_mb_s * self._disk_ref_decay,
+                                        mbps,
+                                        10.0) 
+                pct = (mbps / max(1e-6, self._disk_ref_mb_s)) * 100.0
+
+        self.prev_disk_global = cur
         self.prev_disk_t = now
-        return 0.0
+        return max(0.0, min(100.0, pct))
+
 
     def _update_proc_cache_and_snapshot(self):
         current_pids = set()
         snapshot = []
 
-        # Recorremos procesos con atributos mínimos para evitar llamadas extra
         for p in psutil.process_iter(['pid', 'name']):
             pid = p.info['pid']
             name = (p.info['name'] or "")
@@ -274,7 +230,6 @@ class MainWindow(QMainWindow):
             if proc is None:
                 try:
                     proc = psutil.Process(pid)
-                    # Prime de CPU para ese proceso
                     proc.cpu_percent(None)
                     self.proc_cache[pid] = proc
                     cpu_val = 0.0
@@ -283,7 +238,6 @@ class MainWindow(QMainWindow):
                     continue
             else:
                 try:
-                    # oneshot para minimizar syscalls por proceso
                     with proc.oneshot():
                         cpu_val = proc.cpu_percent(None)
                         mem_mb = proc.memory_info().rss / MB
@@ -297,7 +251,6 @@ class MainWindow(QMainWindow):
                 "mem_mb": float(mem_mb),
             })
 
-        # Limpieza de cache de procesos muertos
         stale = set(self.proc_cache.keys()) - current_pids
         for pid in stale:
             self.proc_cache.pop(pid, None)
@@ -308,13 +261,11 @@ class MainWindow(QMainWindow):
         filtro = self.ui.LineEditFiltroNombre.text().strip().lower()
         limite = max(1, int(self.ui.SpinCantidad.value()))
 
-        # Filtrado barato sobre el snapshot ya calculado
         if filtro:
             rows = [r for r in self.proc_snapshot if filtro in r['name'].lower()]
         else:
             rows = self.proc_snapshot
 
-        # Orden: CPU desc, RAM desc
         rows.sort(key=lambda r: (r['cpu'], r['mem_mb']), reverse=True)
         return rows[:limite]
 
@@ -323,7 +274,6 @@ class MainWindow(QMainWindow):
         sort_col = header.sortIndicatorSection()
         sort_order = header.sortIndicatorOrder()
 
-        # Llenado barato de tabla sin repintado constante
         self.table.setSortingEnabled(False)
         self.table.setUpdatesEnabled(False)
 
@@ -331,20 +281,16 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(data))
 
         for r, proc in enumerate(data):
-            # PID (numérico)
             item_pid = NumericItem(proc['pid'], str(proc['pid']))
             item_pid.setTextAlignment(Qt.AlignCenter)
 
-            # NOMBRE
             item_name = QTableWidgetItem(proc['name'])
             item_name.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
-            # CPU %
             cpu_val = proc['cpu'] if isinstance(proc['cpu'], (int, float)) else 0.0
             item_cpu = NumericItem(cpu_val, f"{cpu_val:.1f}")
             item_cpu.setTextAlignment(Qt.AlignCenter)
 
-            # RAM (MB)
             mem_mb = proc['mem_mb'] if isinstance(proc['mem_mb'], (int, float)) else 0.0
             item_mem = NumericItem(mem_mb, f"{mem_mb:.1f}")
             item_mem.setTextAlignment(Qt.AlignCenter)
